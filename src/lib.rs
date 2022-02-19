@@ -48,10 +48,15 @@ struct MutableState {
   /// Maps a key to an entry containing information about where the
   /// data that belongs to the key is stored.
   index: HashMap<Vec<u8>, IndexEntry>,
+  /// The file that new entries will be written to.
   active_file: File,
   /// The id given to `active_file`.
   active_file_id: usize,
 }
+
+/// Value assigned to records that where the key has been deleted.
+// TODO: this occupies some space, can we occupy less space?
+static TOMBSTONE_VALUE: &'static [u8] = b"__bitcask__tombstone__";
 
 #[derive(Debug)]
 pub struct Bitcask {
@@ -267,6 +272,57 @@ impl Bitcask {
       value,
     })
   }
+
+  /// Forgets about the key.
+  #[instrument(
+    name = "delete",
+    skip_all,
+    fields(key_utf8 = ?String::from_utf8_lossy(key), key = ?key)
+  )]
+  pub fn delete(&self, key: &[u8]) -> std::io::Result<()> {
+    let key_len = key.len();
+    let value_len = TOMBSTONE_VALUE.len();
+
+    let mut content_for_checksum = Vec::with_capacity(key_len + value_len);
+
+    content_for_checksum.extend_from_slice(&key);
+    content_for_checksum.extend_from_slice(&TOMBSTONE_VALUE);
+
+    let checksum = crc32::checksum_ieee(&content_for_checksum);
+
+    let timestamp = chrono::Utc::now().timestamp();
+
+    let mut state = self.state.write().unwrap();
+
+    let record_starts_at_position;
+
+    {
+      let mut writer = BufWriter::new(&mut state.active_file);
+
+      record_starts_at_position = writer.seek(SeekFrom::End(0))?;
+
+      writer.write_u32::<LittleEndian>(checksum)?;
+      writer.write_u32::<LittleEndian>(timestamp as u32)?;
+      writer.write_u32::<LittleEndian>(key_len as u32)?;
+      writer.write_u32::<LittleEndian>(value_len as u32)?;
+      writer.write_all(&key)?;
+      writer.write_all(&TOMBSTONE_VALUE)?;
+
+      writer.flush()?;
+    }
+
+    let entry = IndexEntry {
+      file_id: state.active_file_id,
+      value_len: value_len as u32,
+      timestamp,
+      record_starts_at_position,
+    };
+
+    info!(?entry, "creating index entry");
+    let _ = state.index.remove(key);
+
+    Ok(())
+  }
 }
 
 #[cfg(test)]
@@ -379,6 +435,24 @@ mod tests {
 
       assert_eq!(value, actual);
     }
+
+    Ok(())
+  }
+
+  #[quickcheck_macros::quickcheck]
+  fn delete_keys(key: Vec<u8>, value: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let directory = path(&temp_dir);
+
+    let bitcask = Bitcask::new(Config {
+      directory: directory.clone(),
+    })?;
+
+    bitcask.put(key.clone(), value.clone())?;
+    assert_eq!(Some(value), bitcask.get(&key)?);
+
+    bitcask.delete(&key)?;
+    assert_eq!(None, bitcask.get(&key)?);
 
     Ok(())
   }
