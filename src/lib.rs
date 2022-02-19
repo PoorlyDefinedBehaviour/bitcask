@@ -249,7 +249,7 @@ impl Bitcask {
 
 #[cfg(test)]
 mod tests {
-  use std::{collections::HashSet, os::unix::prelude::AsRawFd, path::PathBuf};
+  use std::collections::HashSet;
 
   use tempfile::TempDir;
 
