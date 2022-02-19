@@ -3,13 +3,14 @@ use std::{
   fs::{File, OpenOptions},
   io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
   path::Path,
+  sync::RwLock,
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc::crc32;
 use tracing::{error, info, instrument};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct IndexEntry {
   /// Monotonically increasing id starting from 0.
   file_id: usize,
@@ -43,18 +44,24 @@ struct Record {
 }
 
 #[derive(Debug)]
-pub struct Bitcask {
+struct MutableState {
   /// Maps a key to an entry containing information about where the
   /// data that belongs to the key is stored.
   index: HashMap<Vec<u8>, IndexEntry>,
   active_file: File,
   /// The id given to `active_file`.
   active_file_id: usize,
+}
+
+#[derive(Debug)]
+pub struct Bitcask {
+  state: RwLock<MutableState>,
   config: Config,
 }
 
 #[derive(Debug)]
 pub struct Config {
+  /// Directory where Bitcask will store its files.
   pub directory: String,
 }
 
@@ -104,8 +111,7 @@ impl Bitcask {
 
     let data_file_path = directory.join(format!("{}.bitcaskdata", file_id));
 
-    Ok(Self {
-      config,
+    let state = MutableState {
       active_file_id: file_id,
       index: HashMap::new(),
       active_file: OpenOptions::new()
@@ -113,6 +119,11 @@ impl Bitcask {
         .create(true)
         .append(true)
         .open(data_file_path)?,
+    };
+
+    Ok(Self {
+      state: RwLock::new(state),
+      config,
     })
   }
 
@@ -125,11 +136,7 @@ impl Bitcask {
       value_utf8 = ?String::from_utf8_lossy(&value), value = ?value
     )
   )]
-  pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> std::io::Result<()> {
-    let mut writer = BufWriter::new(&mut self.active_file);
-
-    let record_starts_at_position = writer.seek(SeekFrom::End(0))?;
-
+  pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> std::io::Result<()> {
     let key_len = key.len();
     let value_len = value.len();
 
@@ -142,24 +149,34 @@ impl Bitcask {
 
     let timestamp = chrono::Utc::now().timestamp();
 
-    writer.write_u32::<LittleEndian>(checksum)?;
-    writer.write_u32::<LittleEndian>(timestamp as u32)?;
-    writer.write_u32::<LittleEndian>(key_len as u32)?;
-    writer.write_u32::<LittleEndian>(value_len as u32)?;
-    writer.write_all(&key)?;
-    writer.write_all(&value)?;
+    let mut state = self.state.write().unwrap();
 
-    writer.flush()?;
+    let record_starts_at_position;
+
+    {
+      let mut writer = BufWriter::new(&mut state.active_file);
+
+      record_starts_at_position = writer.seek(SeekFrom::End(0))?;
+
+      writer.write_u32::<LittleEndian>(checksum)?;
+      writer.write_u32::<LittleEndian>(timestamp as u32)?;
+      writer.write_u32::<LittleEndian>(key_len as u32)?;
+      writer.write_u32::<LittleEndian>(value_len as u32)?;
+      writer.write_all(&key)?;
+      writer.write_all(&value)?;
+
+      writer.flush()?;
+    }
 
     let entry = IndexEntry {
-      file_id: self.active_file_id,
+      file_id: state.active_file_id,
       value_len: value_len as u32,
       timestamp,
       record_starts_at_position,
     };
 
     info!(?entry, "creating index entry");
-    let _ = self.index.insert(key, entry);
+    let _ = state.index.insert(key, entry);
 
     Ok(())
   }
@@ -170,13 +187,18 @@ impl Bitcask {
     skip_all,
     fields(key_utf8 = ?String::from_utf8_lossy(key), key = ?key)
   )]
-  pub fn get(&mut self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
-    let entry = match self.index.get(key) {
-      None => return Ok(None),
-      Some(entry) => entry,
+  pub fn get(&self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
+    let entry = {
+      let state = self.state.read().unwrap();
+      match state.index.get(key) {
+        None => return Ok(None),
+        // Cloning this should be fine since
+        // IndexEntry size is 4 * 64 bits (i guess).
+        Some(entry) => entry.clone(),
+      }
     };
 
-    info!(?entry, "entry found");
+    info!(?entry, "entry file id found");
 
     let path: &Path = self.config.directory.as_ref();
     let file_path = path.join(format!("{}.bitcaskdata", entry.file_id));
@@ -273,7 +295,7 @@ mod tests {
         directory: directory.clone(),
       })?;
 
-      assert_eq!(i, bitcask.active_file_id);
+      assert_eq!(i, bitcask.state.read().unwrap().active_file_id);
     }
 
     // [
@@ -304,7 +326,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let mut bitcask = Bitcask::new(Config {
+    let bitcask = Bitcask::new(Config {
       directory: directory.clone(),
     })?;
 
@@ -321,7 +343,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let mut bitcask = Bitcask::new(Config {
+    let bitcask = Bitcask::new(Config {
       directory: directory.clone(),
     })?;
 
@@ -346,7 +368,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let mut bitcask = Bitcask::new(Config {
+    let bitcask = Bitcask::new(Config {
       directory: directory.clone(),
     })?;
 
@@ -359,5 +381,11 @@ mod tests {
     }
 
     Ok(())
+  }
+
+  #[test]
+  fn bitcask_is_send_and_sync() {
+    fn is_send_and_sync<T: Send + Sync>() {}
+    is_send_and_sync::<Bitcask>();
   }
 }
