@@ -263,6 +263,40 @@ mod tests {
     s.as_bytes().to_vec()
   }
 
+  #[test_log::test]
+  fn each_bitcask_instance_creates_a_new_data_file() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let directory = path(&temp_dir);
+
+    for i in 0..3 {
+      let bitcask = Bitcask::new(Config {
+        directory: directory.clone(),
+      })?;
+
+      assert_eq!(i, bitcask.active_file_id);
+    }
+
+    // [
+    //  "/tmp/.tmpWluSFr/0.bitcaskdata",
+    //  "/tmp/.tmpWluSFr/1.bitcaskdata",
+    //  "/tmp/.tmpWluSFr/2.bitcaskdata",
+    // ]
+    let file_names: Vec<String> = std::fs::read_dir(&directory)
+      .unwrap()
+      .map(|entry| entry.unwrap().path().display().to_string())
+      .collect();
+
+    assert_eq!(3, file_names.len());
+
+    for i in 0..3 {
+      assert!(file_names
+        .iter()
+        .any(|file_name| file_name.contains(&format!("{}.bitcaskdata", i))));
+    }
+
+    Ok(())
+  }
+
   #[quickcheck_macros::quickcheck]
   fn get_returns_none_if_key_does_not_exist_empty_bitcask(
     key: Vec<u8>,
