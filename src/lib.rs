@@ -13,11 +13,11 @@ use tracing::{error, info, instrument};
 struct IndexEntry {
   /// Monotonically increasing id starting from 0.
   file_id: usize,
-  /// The number of bytes that make up the value that starts at `value_starts_at_position`.
+  /// The number of bytes that make up the value.
   value_len: u32,
-  /// The position in the file identified by `file_id` where the value of
-  /// this entry starts.
-  value_starts_at_position: u64,
+  /// The position in the file identified by `file_id` where the
+  /// record pointed by this entry starts.
+  record_starts_at_position: u64,
   /// Timestamp of when the value was appended.
   timestamp: i64,
 }
@@ -120,12 +120,15 @@ impl Bitcask {
   #[instrument(
     name = "put",
     skip_all,
-    fields(key_utf8 = ?String::from_utf8_lossy(&key), key = ?key)
+    fields(
+      key_utf8 = ?String::from_utf8_lossy(&key), key = ?key,
+      value_utf8 = ?String::from_utf8_lossy(&value), value = ?value
+    )
   )]
   pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> std::io::Result<()> {
     let mut writer = BufWriter::new(&mut self.active_file);
 
-    let value_starts_at_position = writer.seek(SeekFrom::End(0))?;
+    let record_starts_at_position = writer.seek(SeekFrom::End(0))?;
 
     let key_len = key.len();
     let value_len = value.len();
@@ -148,15 +151,15 @@ impl Bitcask {
 
     writer.flush()?;
 
-    let _ = self.index.insert(
-      key,
-      IndexEntry {
-        file_id: self.active_file_id,
-        value_len: value_len as u32,
-        timestamp,
-        value_starts_at_position,
-      },
-    );
+    let entry = IndexEntry {
+      file_id: self.active_file_id,
+      value_len: value_len as u32,
+      timestamp,
+      record_starts_at_position,
+    };
+
+    info!(?entry, "creating index entry");
+    let _ = self.index.insert(key, entry);
 
     Ok(())
   }
@@ -173,10 +176,12 @@ impl Bitcask {
       Some(entry) => entry,
     };
 
+    info!(?entry, "entry found");
+
     let path: &Path = self.config.directory.as_ref();
     let file_path = path.join(format!("{}.bitcaskdata", entry.file_id));
 
-    info!(file_path = ?file_path, "opening bitcaskdata file");
+    info!(?file_path, "opening bitcaskdata file");
 
     let reader = match File::open(&file_path) {
       Err(e) => {
@@ -186,15 +191,33 @@ impl Bitcask {
       Ok(file) => BufReader::new(file),
     };
 
-    Bitcask::process_record(reader).map(|record| Some(record.value))
+    let record = Bitcask::process_record(reader, entry.record_starts_at_position)?;
+
+    info!(?record, "record found");
+
+    Ok(Some(record.value))
   }
 
   // Reads a record into memory.
-  fn process_record(mut reader: impl Read) -> std::io::Result<Record> {
+  #[instrument(name = "Processing record", skip_all, fields(record_starts_at_position = record_starts_at_position))]
+  fn process_record(
+    mut reader: impl Read + Seek,
+    record_starts_at_position: u64,
+  ) -> std::io::Result<Record> {
+    // Move the reader to where the record starts.
+    reader.seek(SeekFrom::Start(record_starts_at_position))?;
+
     let expected_checksum = reader.read_u32::<LittleEndian>()?;
+    info!(checksum = expected_checksum, "read checksum from file");
+
     let timestamp = reader.read_u32::<LittleEndian>()?;
+    info!(timestamp, "read timestamp from file");
+
     let key_len = reader.read_u32::<LittleEndian>()?;
+    info!(key_len, "read key length from file");
+
     let value_len = reader.read_u32::<LittleEndian>()?;
+    info!(value_len, "read value length from file");
 
     let mut buffer = Vec::with_capacity((key_len + value_len) as usize);
 
@@ -212,6 +235,7 @@ impl Bitcask {
     }
 
     let value = buffer.split_off(key_len as usize);
+
     let key = buffer;
 
     Ok(Record {
@@ -225,7 +249,7 @@ impl Bitcask {
 
 #[cfg(test)]
 mod tests {
-  use std::{os::unix::prelude::AsRawFd, path::PathBuf};
+  use std::{collections::HashSet, os::unix::prelude::AsRawFd, path::PathBuf};
 
   use tempfile::TempDir;
 
@@ -239,20 +263,10 @@ mod tests {
     s.as_bytes().to_vec()
   }
 
-  fn active_file_contents(bitcask: &Bitcask) -> std::io::Result<String> {
-    // first construct the path to the symlink under /proc
-    let path_in_proc = PathBuf::from(format!("/proc/self/fd/{}", bitcask.active_file.as_raw_fd()));
-
-    // ...and follow it back to the original file
-    let file_path = std::fs::read_link(path_in_proc)?;
-
-    let contents = std::fs::read(file_path)?;
-
-    Ok(String::from_utf8_lossy(&contents).to_string())
-  }
-
-  #[test_log::test]
-  fn append_writes_to_active_file() -> Result<(), Box<dyn std::error::Error>> {
+  #[quickcheck_macros::quickcheck]
+  fn get_returns_none_if_key_does_not_exist_empty_bitcask(
+    key: Vec<u8>,
+  ) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
@@ -260,50 +274,16 @@ mod tests {
       directory: directory.clone(),
     })?;
 
-    bitcask.put(bytes("key"), bytes("value"))?;
-
-    dbg!(active_file_contents(&bitcask)?);
-
-    // TODO: actually test something
-    assert!(false);
-    Ok(())
-  }
-
-  #[test_log::test]
-  fn append_updates_index() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let directory = path(&temp_dir);
-
-    let mut bitcask = Bitcask::new(Config {
-      directory: directory.clone(),
-    })?;
-
-    let key1 = bytes("key1");
-    let value1 = bytes("value1");
-    bitcask.put(key1.clone(), value1.clone())?;
-    let entry = bitcask.index.get(&key1).unwrap();
-
-    assert_eq!(bitcask.active_file_id, entry.file_id);
-    assert_eq!(value1.len() as u32, entry.value_len);
-    assert_eq!(0, entry.value_starts_at_position);
-
-    let key2 = bytes("key2");
-    let value2 = bytes("value2");
-    bitcask.put(key2.clone(), value2.clone())?;
-    let entry = bitcask.index.get(&key2).unwrap();
-
-    dbg!(key2.len());
-    dbg!(value2.len());
-
-    assert_eq!(bitcask.active_file_id, entry.file_id);
-    assert_eq!(value2.len() as u32, entry.value_len);
-    assert_eq!(0, entry.value_starts_at_position);
+    assert_eq!(None, bitcask.get(&key).unwrap());
 
     Ok(())
   }
 
-  #[test_log::test]
-  fn get_returns_none_if_key_does_not_exist() -> Result<(), Box<dyn std::error::Error>> {
+  #[quickcheck_macros::quickcheck]
+  fn get_returns_none_if_key_does_not_exist(
+    keys: HashSet<Vec<u8>>,
+    key: Vec<u8>,
+  ) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
@@ -311,13 +291,24 @@ mod tests {
       directory: directory.clone(),
     })?;
 
-    assert_eq!(None, bitcask.get(&bytes("unknown_key")).unwrap());
+    // Ignore this batch if key is in `keys`.
+    if keys.contains(&key) {
+      return Ok(());
+    }
+
+    for other_key in keys {
+      assert_eq!(None, bitcask.get(&key).unwrap());
+      bitcask.put(other_key.clone(), other_key)?;
+      assert_eq!(None, bitcask.get(&key).unwrap());
+    }
 
     Ok(())
   }
 
-  #[test_log::test]
-  fn get_return_value_associated_with_key() -> Result<(), Box<dyn std::error::Error>> {
+  #[quickcheck_macros::quickcheck]
+  fn get_returns_value_associated_with_key(
+    entries: Vec<(String, String)>,
+  ) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
@@ -325,12 +316,13 @@ mod tests {
       directory: directory.clone(),
     })?;
 
-    let key = bytes("key");
-    let value = bytes("value");
+    for (key, value) in entries {
+      bitcask.put(bytes(&key), bytes(&value))?;
 
-    bitcask.put(key.clone(), value.clone())?;
+      let actual = String::from_utf8_lossy(&bitcask.get(&bytes(&key))?.unwrap()).to_string();
 
-    assert_eq!(Some(value), bitcask.get(&key).unwrap());
+      assert_eq!(value, actual);
+    }
 
     Ok(())
   }
