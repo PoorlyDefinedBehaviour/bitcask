@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 byteorder = "1.2"
 crc = "1.7"
+chrono = "0.4"
