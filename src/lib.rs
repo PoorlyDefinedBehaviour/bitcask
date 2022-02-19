@@ -56,7 +56,7 @@ struct MutableState {
 
 /// Value assigned to records that where the key has been deleted.
 // TODO: this occupies some space, can we occupy less space?
-static TOMBSTONE_VALUE: &'static [u8] = b"__bitcask__tombstone__";
+static TOMBSTONE_VALUE: &[u8] = b"__bitcask__tombstone__";
 
 #[derive(Debug)]
 pub struct Bitcask {
@@ -285,8 +285,8 @@ impl Bitcask {
 
     let mut content_for_checksum = Vec::with_capacity(key_len + value_len);
 
-    content_for_checksum.extend_from_slice(&key);
-    content_for_checksum.extend_from_slice(&TOMBSTONE_VALUE);
+    content_for_checksum.extend_from_slice(key);
+    content_for_checksum.extend_from_slice(TOMBSTONE_VALUE);
 
     let checksum = crc32::checksum_ieee(&content_for_checksum);
 
@@ -305,8 +305,8 @@ impl Bitcask {
       writer.write_u32::<LittleEndian>(timestamp as u32)?;
       writer.write_u32::<LittleEndian>(key_len as u32)?;
       writer.write_u32::<LittleEndian>(value_len as u32)?;
-      writer.write_all(&key)?;
-      writer.write_all(&TOMBSTONE_VALUE)?;
+      writer.write_all(key)?;
+      writer.write_all(TOMBSTONE_VALUE)?;
 
       writer.flush()?;
     }
@@ -322,6 +322,18 @@ impl Bitcask {
     let _ = state.index.remove(key);
 
     Ok(())
+  }
+
+  /// Returns a list of the keys we have at the moment.
+  #[instrument(name = "list_keys", skip_all)]
+  pub fn list_keys(&self) -> Vec<Vec<u8>> {
+    let state = self.state.read().unwrap();
+
+    let keys: Vec<Vec<u8>> = state.index.keys().cloned().collect();
+
+    info!(num_keys = keys.len());
+
+    keys
   }
 }
 
@@ -453,6 +465,28 @@ mod tests {
 
     bitcask.delete(&key)?;
     assert_eq!(None, bitcask.get(&key)?);
+
+    Ok(())
+  }
+
+  #[quickcheck_macros::quickcheck]
+  fn list_keys(entries: HashSet<(Vec<u8>, Vec<u8>)>) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let directory = path(&temp_dir);
+
+    let bitcask = Bitcask::new(Config {
+      directory: directory.clone(),
+    })?;
+
+    let expected: HashSet<Vec<u8>> = entries.iter().map(|(key, _value)| key.clone()).collect();
+
+    for (key, value) in entries {
+      bitcask.put(key, value)?;
+    }
+
+    let actual: HashSet<Vec<u8>> = bitcask.list_keys().into_iter().collect();
+
+    assert_eq!(expected, actual);
 
     Ok(())
   }
