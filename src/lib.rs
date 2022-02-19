@@ -68,6 +68,9 @@ pub struct Bitcask {
 pub struct Config {
   /// Directory where Bitcask will store its files.
   pub directory: String,
+  /// True if this instance of Bitcask is the one that handles writes.
+  /// There should always be only once instance that writes to files.
+  pub writer: bool,
 }
 
 impl Bitcask {
@@ -122,7 +125,7 @@ impl Bitcask {
       active_file: OpenOptions::new()
         .read(true)
         .create(true)
-        .append(true)
+        .append(config.writer)
         .open(data_file_path)?,
     };
 
@@ -353,16 +356,20 @@ mod tests {
     s.as_bytes().to_vec()
   }
 
+  fn default_bitcask(directory: String) -> std::io::Result<Bitcask> {
+    Bitcask::new(Config {
+      directory,
+      writer: true,
+    })
+  }
+
   #[test_log::test]
   fn each_bitcask_instance_creates_a_new_data_file() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
     for i in 0..3 {
-      let bitcask = Bitcask::new(Config {
-        directory: directory.clone(),
-      })?;
-
+      let bitcask = default_bitcask(directory.clone())?;
       assert_eq!(i, bitcask.state.read().unwrap().active_file_id);
     }
 
@@ -394,9 +401,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let bitcask = Bitcask::new(Config {
-      directory: directory.clone(),
-    })?;
+    let bitcask = default_bitcask(directory.clone())?;
 
     assert_eq!(None, bitcask.get(&key).unwrap());
 
@@ -411,9 +416,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let bitcask = Bitcask::new(Config {
-      directory: directory.clone(),
-    })?;
+    let bitcask = default_bitcask(directory.clone())?;
 
     // Ignore this batch if key is in `keys`.
     if keys.contains(&key) {
@@ -436,9 +439,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let bitcask = Bitcask::new(Config {
-      directory: directory.clone(),
-    })?;
+    let bitcask = default_bitcask(directory.clone())?;
 
     for (key, value) in entries {
       bitcask.put(bytes(&key), bytes(&value))?;
@@ -456,9 +457,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let bitcask = Bitcask::new(Config {
-      directory: directory.clone(),
-    })?;
+    let bitcask = default_bitcask(directory.clone())?;
 
     bitcask.put(key.clone(), value.clone())?;
     assert_eq!(Some(value), bitcask.get(&key)?);
@@ -474,9 +473,7 @@ mod tests {
     let temp_dir = tempfile::tempdir()?;
     let directory = path(&temp_dir);
 
-    let bitcask = Bitcask::new(Config {
-      directory: directory.clone(),
-    })?;
+    let bitcask = default_bitcask(directory.clone())?;
 
     let expected: HashSet<Vec<u8>> = entries.iter().map(|(key, _value)| key.clone()).collect();
 
