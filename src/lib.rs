@@ -83,7 +83,7 @@ impl Bitcask {
     // we know that the latest file is file number 2.
     let latest_id = file_names
       .iter()
-      .map(|file_name| file_name.split(".").collect::<Vec<_>>())
+      .map(|file_name| file_name.split('.').collect::<Vec<_>>())
       .filter_map(|file_name_pieces| file_name_pieces.first().cloned())
       .map(|offset| offset.parse::<usize>().unwrap())
       .max();
@@ -168,7 +168,7 @@ impl Bitcask {
   #[instrument(
     name = "get",
     skip_all,
-    fields(key_utf8 = ?String::from_utf8_lossy(&key), key = ?key)
+    fields(key_utf8 = ?String::from_utf8_lossy(key), key = ?key)
   )]
   pub fn get(&mut self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
     let entry = match self.index.get(key) {
