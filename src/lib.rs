@@ -131,12 +131,10 @@ impl Bitcask {
       .append(config.writer)
       .open(data_file_path)?;
 
-    let active_file_size_in_bytes = active_file.metadata()?.len();
-
     let state = MutableState {
       active_file_id: file_id,
       index: HashMap::new(),
-      active_file_size_in_bytes,
+      active_file_size_in_bytes: 0,
       active_file,
     };
 
@@ -210,6 +208,33 @@ impl Bitcask {
     let _ = state.index.insert(key, entry);
 
     state.active_file_size_in_bytes += entry_size_in_bytes;
+
+    if state.active_file_size_in_bytes >= self.config.max_active_file_size_in_bytes {
+      info!(
+        active_file_id = state.active_file_id,
+        active_file_size_in_bytes = state.active_file_size_in_bytes,
+        max_active_file_size_in_bytes = self.config.max_active_file_size_in_bytes,
+        "active file has reached its maximum size. creating a new active file"
+      );
+
+      state.active_file_id += 1;
+
+      let directory: &Path = self.config.directory.as_ref();
+      let data_file_path = directory.join(format!("{}.bitcaskdata", state.active_file_id));
+
+      state.active_file = OpenOptions::new()
+        .read(true)
+        .create(true)
+        .append(self.config.writer)
+        .open(data_file_path)?;
+
+      state.active_file_size_in_bytes = 0;
+
+      info!(
+        active_file_id = state.active_file_id,
+        "new active file created"
+      );
+    }
 
     Ok(())
   }
@@ -389,6 +414,21 @@ mod tests {
     })
   }
 
+  /// Returns a list of file names like:
+  ///
+  /// [
+  ///  "0.bitcaskdata",
+  ///  "1.bitcaskdata",
+  ///  "2.bitcaskdata",
+  /// ]
+  fn get_file_names(dir: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+      .unwrap()
+      .map(|entry| entry.unwrap().path().display().to_string())
+      .map(|s| s.split("/").last().unwrap().to_string())
+      .collect()
+  }
+
   #[test_log::test]
   fn each_bitcask_instance_creates_a_new_data_file() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -399,22 +439,12 @@ mod tests {
       assert_eq!(i, bitcask.state.read().unwrap().active_file_id);
     }
 
-    // [
-    //  "/tmp/.tmpWluSFr/0.bitcaskdata",
-    //  "/tmp/.tmpWluSFr/1.bitcaskdata",
-    //  "/tmp/.tmpWluSFr/2.bitcaskdata",
-    // ]
-    let file_names: Vec<String> = std::fs::read_dir(&directory)
-      .unwrap()
-      .map(|entry| entry.unwrap().path().display().to_string())
-      .collect();
+    let file_names = get_file_names(&directory);
 
     assert_eq!(3, file_names.len());
 
     for i in 0..3 {
-      assert!(file_names
-        .iter()
-        .any(|file_name| file_name.contains(&format!("{}.bitcaskdata", i))));
+      assert!(file_names.contains(&format!("{}.bitcaskdata", i)));
     }
 
     Ok(())
@@ -510,6 +540,36 @@ mod tests {
     let actual: HashSet<Vec<u8>> = bitcask.list_keys().into_iter().collect();
 
     assert_eq!(expected, actual);
+
+    Ok(())
+  }
+
+  #[test_log::test]
+  fn closes_active_file_that_becomes_too_large() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let directory = path(&temp_dir);
+
+    let bitcask = Bitcask::new(Config {
+      directory: directory.clone(),
+      writer: true,
+      max_active_file_size_in_bytes: 5,
+    })?;
+
+    assert_eq!(0, bitcask.state.read().unwrap().active_file_id);
+
+    bitcask.put(bytes("key"), bytes("value_with_more_than_5_bytes"))?;
+
+    assert_eq!(1, bitcask.state.read().unwrap().active_file_id);
+    assert_eq!(0, bitcask.state.read().unwrap().active_file_size_in_bytes);
+
+    let file_names = HashSet::from_iter(get_file_names(&directory));
+
+    let expected: HashSet<String> = HashSet::from_iter(vec![
+      String::from("0.bitcaskdata"),
+      String::from("1.bitcaskdata"),
+    ]);
+
+    assert_eq!(expected, file_names);
 
     Ok(())
   }
