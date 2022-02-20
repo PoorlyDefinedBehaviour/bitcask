@@ -49,6 +49,26 @@ struct Record {
   value: Vec<u8>,
 }
 
+/// Represents a Bitcask hint record. A hint file is created when a merge happens
+/// and it contains a list of hint records.
+/// Hint files are used to rebuild the index when a Bitcask instance is created.
+///
+/// A hint record looks like this on disk:
+///                  ┌──────────────size of───────────────┐
+///                  │                                    │
+///                  │                                    │
+/// ┌───────────┬────┴────┬───────────┬───────────┬───────▼──────┐
+/// │ timestamp │ key_len │ value_len │ value_pos │      key     │
+/// └───────────┴─────────┴───────────┴───────────┴──────────────┘
+///      u32        u32       u32          u32      [u8; key_len]
+#[derive(Debug)]
+struct Hint {
+  timestamp: u32,
+  key: Vec<u8>,
+  value_len: u32,
+  record_starts_at_position: u32,
+}
+
 #[derive(Debug)]
 struct MutableState {
   /// Maps a key to an entry containing information about where the
@@ -144,11 +164,8 @@ impl Bitcask {
       .unwrap_or(0)
   }
 
-  #[instrument(name = "Processing a hint record", skip_all, fields(file_id = file_id))]
-  fn process_hint_file<R: Read + Seek>(
-    file_id: usize,
-    reader: &mut R,
-  ) -> std::io::Result<(Vec<u8>, IndexEntry)> {
+  #[instrument(name = "Processing a hint record", skip_all)]
+  fn process_hint_file<R: Read + Seek>(reader: &mut R) -> std::io::Result<Hint> {
     let timestamp = reader.read_u32::<LittleEndian>()?;
     info!(timestamp, "read timestamp from file");
 
@@ -167,15 +184,12 @@ impl Bitcask {
 
     let key = buffer;
 
-    Ok((
+    Ok(Hint {
       key,
-      IndexEntry {
-        file_id,
-        record_starts_at_position,
-        timestamp,
-        value_len,
-      },
-    ))
+      record_starts_at_position,
+      timestamp,
+      value_len,
+    })
   }
 
   #[instrument(name = "Rebuilding index from files in the Bitcask directory", skip_all, fields(files = ?files))]
@@ -250,15 +264,21 @@ impl Bitcask {
           loop {
             let _ = reader.seek(SeekFrom::Current(0))?;
 
-            match Bitcask::process_hint_file(file_id, &mut reader) {
+            match Bitcask::process_hint_file(&mut reader) {
               Err(err) => match err.kind() {
                 std::io::ErrorKind::UnexpectedEof => {
                   break;
                 }
                 _ => return Err(err),
               },
-              Ok((key, index_entry)) => {
-                index.insert(key, index_entry);
+              Ok(hint) => {
+                let entry = IndexEntry {
+                  file_id,
+                  record_starts_at_position: hint.record_starts_at_position,
+                  timestamp: hint.timestamp,
+                  value_len: hint.value_len,
+                };
+                index.insert(hint.key, entry);
               }
             }
           }
