@@ -55,6 +55,9 @@ struct MutableState {
   active_file: File,
   /// The id given to `active_file`.
   active_file_id: usize,
+  /// The number of files in the Bitcask directory.
+  /// Used to know when we need to perform merging.
+  num_files_in_directory: usize,
 }
 
 /// Value assigned to records that where the key has been deleted.
@@ -77,19 +80,32 @@ pub struct Config {
   /// The file being written to will be closed when its size is surpasses the maximum file size
   /// and a new file will be created.
   pub max_active_file_size_in_bytes: u64,
+  /// We will perform merging after the Bitcask directory has a number of files
+  /// thats >= `merge_files_after_n_files_created`.
+  pub merge_files_after_n_files_created: usize,
 }
 
 impl Bitcask {
-  fn get_file_id<P: AsRef<Path>>(directory: &P) -> std::io::Result<usize> {
+  fn file_id_from_file_path(path: &str) -> usize {
+    path.split('.').last().unwrap().parse::<usize>().unwrap()
+  }
+
+  fn get_file_paths(directory: &str) -> Vec<String> {
+    std::fs::read_dir(directory)
+      .unwrap()
+      .filter(|entry| entry.is_ok())
+      .map(|entry| entry.unwrap().path().display().to_string())
+      .filter(|file_name| file_name.contains("bitcask"))
+      .collect()
+  }
+  fn get_file_id(directory: &str) -> std::io::Result<(usize, usize)> {
     // Ensure `directory` exists.
     std::fs::create_dir_all(directory)?;
 
-    let file_names: Vec<String> = std::fs::read_dir(directory)?
-      .filter(|entry| entry.is_ok())
-      .map(|entry| entry.unwrap().file_name())
-      .map(|file_name| file_name.into_string().unwrap())
-      // Ensure we only take files that were created by Bitcask.
-      .filter(|file_name| file_name.ends_with(".bitcaskdata"))
+    let file_names: Vec<String> = Bitcask::get_file_paths(directory)
+      .into_iter()
+      // Ensure we only take data files.
+      .filter(|file_name| file_name.contains("bitcask.data"))
       .collect();
 
     // Given a directory that has a bunch of Bitcask files, we want to find out which file is the latest
@@ -97,15 +113,14 @@ impl Bitcask {
     //
     // If we have the following files:
     //
-    // dir/0.bitcaskdata
-    // dir/1.bitcaskdata
-    // dir/2.bitcaskdata
+    // dir/bitcask.data.0
+    // dir/bitcask.data.1
+    // dir/bitcask.data.2
     //
     // we know that the latest file is file number 2.
     let latest_id = file_names
       .iter()
-      .map(|file_name| file_name.split('.').collect::<Vec<_>>())
-      .filter_map(|file_name_pieces| file_name_pieces.first().cloned())
+      .map(|file_path| file_path.split('.').last().unwrap().to_string())
       .map(|offset| offset.parse::<usize>().unwrap())
       .max();
 
@@ -114,16 +129,14 @@ impl Bitcask {
       Some(id) => id + 1,
     };
 
-    Ok(new_id)
+    Ok((new_id, file_names.len()))
   }
 
   #[instrument(name = "Creating Bitcask instance", skip_all, fields(config = ?config))]
   pub fn new(config: Config) -> std::io::Result<Self> {
-    let directory: &Path = config.directory.as_ref();
+    let (file_id, num_files_in_directory) = Bitcask::get_file_id(&config.directory)?;
 
-    let file_id = Bitcask::get_file_id(&directory)?;
-
-    let data_file_path = directory.join(format!("{}.bitcaskdata", file_id));
+    let data_file_path = Path::new(&config.directory).join(format!("bitcask.data.{}", file_id));
 
     let active_file = OpenOptions::new()
       .read(true)
@@ -136,6 +149,8 @@ impl Bitcask {
       index: HashMap::new(),
       active_file_size_in_bytes: 0,
       active_file,
+      // Add 1 to take the file we just created into account.
+      num_files_in_directory: num_files_in_directory + 1,
     };
 
     Ok(Self {
@@ -219,8 +234,8 @@ impl Bitcask {
 
       state.active_file_id += 1;
 
-      let directory: &Path = self.config.directory.as_ref();
-      let data_file_path = directory.join(format!("{}.bitcaskdata", state.active_file_id));
+      let data_file_path =
+        Path::new(&self.config.directory).join(format!("bitcask.data.{}", state.active_file_id));
 
       state.active_file = OpenOptions::new()
         .read(true)
@@ -229,6 +244,7 @@ impl Bitcask {
         .open(data_file_path)?;
 
       state.active_file_size_in_bytes = 0;
+      state.num_files_in_directory += 1;
 
       info!(
         active_file_id = state.active_file_id,
@@ -236,7 +252,167 @@ impl Bitcask {
       );
     }
 
+    if state.num_files_in_directory >= self.config.merge_files_after_n_files_created {
+      info!(
+        num_files_in_directory = state.num_files_in_directory,
+        merge_files_after_n_files_created = self.config.merge_files_after_n_files_created,
+        "directory reached the maximum number of files"
+      );
+
+      self.merge(&mut state)?;
+    }
+
     Ok(())
+  }
+
+  /// Merges immutable data files into a new file that contains
+  /// only the newest values for each key.
+  #[instrument(name = "merge", skip_all)]
+  fn merge(&self, state: &mut MutableState) -> std::io::Result<()> {
+    // dir/bitcask.data.0
+    // dir/bitcask.data.2
+    // dir/bitcask.data.1
+    let mut file_paths: Vec<(usize, String)> = Bitcask::get_file_paths(&self.config.directory)
+      .into_iter()
+      // Ensure we only take data files that were created by Bitcask.
+      .filter(|file_path| file_path.contains("bitcask.data"))
+      .map(|file_path| (Bitcask::file_id_from_file_path(&file_path), file_path))
+      .filter(|(file_id, _)| *file_id != state.active_file_id)
+      .collect();
+
+    // Sort file paths by the file id:
+    // dir/bitcask.data.0
+    // dir/bitcask.data.1
+    // dir/bitcask.data.2
+    file_paths.sort_unstable_by_key(|(file_id, _file_path)| *file_id);
+
+    info!(num_files = file_paths.len(), "merging files");
+
+    let mut mapping = HashMap::new();
+
+    // Build a map from key to value starting from the oldest file
+    // so we end up with the latest value for each key.
+    for (_, file_path) in file_paths.iter() {
+      info!(?file_path, "processing file and then merging it");
+
+      let mut reader = BufReader::new(File::open(file_path)?);
+      match Bitcask::process_record(&mut reader) {
+        Err(err) => match err.kind() {
+          std::io::ErrorKind::UnexpectedEof => {
+            break;
+          }
+          _ => return Err(err),
+        },
+        Ok(record) => {
+          mapping.insert(record.key, record.value);
+        }
+      }
+    }
+
+    // Create a temporary file.
+    let merged_file_id = state.active_file_id - 1;
+    let merged_file_path =
+      Path::new(&self.config.directory).join(format!("bitcask.data.merged.{}", merged_file_id));
+
+    let mut merged_file_writer = BufWriter::new(
+      OpenOptions::new()
+        .read(true)
+        .create(true)
+        .append(self.config.writer)
+        .open(&merged_file_path)?,
+    );
+
+    let mut hint_file_writer = BufWriter::new(
+      OpenOptions::new()
+        .read(true)
+        .create(true)
+        .append(self.config.writer)
+        .open(Path::new(&self.config.directory).join(format!("bitcask.hint.{}", merged_file_id)))?,
+    );
+
+    let mut index = HashMap::new();
+
+    // Create a file that contains only the latest value for each key.
+    for (key, value) in mapping {
+      let key_len = key.len();
+      let value_len = value.len();
+
+      let mut content_for_checksum = Vec::with_capacity(key_len + value_len);
+
+      content_for_checksum.extend_from_slice(&key);
+      content_for_checksum.extend_from_slice(&value);
+
+      let checksum = crc32::checksum_ieee(&content_for_checksum);
+
+      let timestamp = chrono::Utc::now().timestamp();
+
+      let record_starts_at_position;
+
+      record_starts_at_position = merged_file_writer.seek(SeekFrom::End(0))?;
+
+      merged_file_writer.write_u32::<LittleEndian>(checksum)?;
+      merged_file_writer.write_u32::<LittleEndian>(timestamp as u32)?;
+      merged_file_writer.write_u32::<LittleEndian>(key_len as u32)?;
+      merged_file_writer.write_u32::<LittleEndian>(value_len as u32)?;
+      merged_file_writer.write_all(&key)?;
+      merged_file_writer.write_all(&value)?;
+
+      hint_file_writer.write_u32::<LittleEndian>(timestamp as u32)?;
+      hint_file_writer.write_u32::<LittleEndian>(key_len as u32)?;
+      hint_file_writer.write_u32::<LittleEndian>(value_len as u32)?;
+      hint_file_writer.write_u32::<LittleEndian>(record_starts_at_position as u32)?;
+      hint_file_writer.write_all(&key)?;
+
+      let entry = IndexEntry {
+        file_id: merged_file_id,
+        value_len: value_len as u32,
+        timestamp,
+        record_starts_at_position,
+      };
+
+      index.insert(key, entry);
+    }
+
+    merged_file_writer.flush()?;
+    hint_file_writer.flush()?;
+
+    state.index = index;
+
+    for (_file_id, file_path) in file_paths.iter() {
+      info!(?file_path, "removing old data file that has been merged");
+      // This error is not a show stopper since we can just reprocess the file after in the next merge.
+      match std::fs::remove_file(file_path) {
+        Err(err) => {
+          error!(error = ?err, ?file_path, "error removing old data file that has been merged");
+          // Do not delete newer files to avoid ending up in a invalid state when we try to merge again.
+          break;
+        }
+        Ok(_) => {
+          state.num_files_in_directory -= 1;
+        }
+      }
+    }
+
+    // Since everything worked out, promote the temporary file to a data file.
+    self.promote_merged_file_to_data_file(&merged_file_path, merged_file_id)?;
+
+    Ok(())
+  }
+
+  #[instrument(
+    name = "Promoting merged file to data file",
+    skip_all,
+    fields(merged_file_path = ?merged_file_path, merged_file_id = merged_file_id)
+  )]
+  fn promote_merged_file_to_data_file(
+    &self,
+    merged_file_path: &Path,
+    merged_file_id: usize,
+  ) -> std::io::Result<()> {
+    std::fs::rename(
+      merged_file_path,
+      Path::new(&self.config.directory).join(format!("bitcask.data.{}", merged_file_id)),
+    )
   }
 
   /// Returns the value associated with the key.
@@ -256,22 +432,25 @@ impl Bitcask {
       }
     };
 
-    info!(?entry, "entry file id found");
+    info!(?entry, "entry found");
 
-    let path: &Path = self.config.directory.as_ref();
-    let file_path = path.join(format!("{}.bitcaskdata", entry.file_id));
+    let file_path =
+      Path::new(&self.config.directory).join(format!("bitcask.data.{}", entry.file_id));
 
-    info!(?file_path, "opening bitcaskdata file");
+    info!(?file_path, "opening data file");
 
-    let reader = match File::open(&file_path) {
+    let mut reader = match File::open(&file_path) {
       Err(e) => {
-        error!(error = ?e, "bitcaskdata file not found");
+        error!(error = ?e, "data file not found");
         return Err(e);
       }
       Ok(file) => BufReader::new(file),
     };
 
-    let record = Bitcask::process_record(reader, entry.record_starts_at_position)?;
+    // Move the reader to where the record starts.
+    reader.seek(SeekFrom::Start(entry.record_starts_at_position))?;
+
+    let record = Bitcask::process_record(&mut reader)?;
 
     info!(?record, "record found");
 
@@ -279,14 +458,8 @@ impl Bitcask {
   }
 
   // Reads a record into memory.
-  #[instrument(name = "Processing record", skip_all, fields(record_starts_at_position = record_starts_at_position))]
-  fn process_record(
-    mut reader: impl Read + Seek,
-    record_starts_at_position: u64,
-  ) -> std::io::Result<Record> {
-    // Move the reader to where the record starts.
-    reader.seek(SeekFrom::Start(record_starts_at_position))?;
-
+  #[instrument(name = "Processing record", skip_all)]
+  fn process_record<R: Read + Seek>(reader: &mut R) -> std::io::Result<Record> {
     let expected_checksum = reader.read_u32::<LittleEndian>()?;
     info!(checksum = expected_checksum, "read checksum from file");
 
@@ -411,15 +584,16 @@ mod tests {
       directory,
       writer: true,
       max_active_file_size_in_bytes: 1024 * 1024,
+      merge_files_after_n_files_created: 32,
     })
   }
 
   /// Returns a list of file names like:
   ///
   /// [
-  ///  "0.bitcaskdata",
-  ///  "1.bitcaskdata",
-  ///  "2.bitcaskdata",
+  ///  "bitcask.data.0",
+  ///  "bitcask.data.1",
+  ///  "bitcask.data.1",
   /// ]
   fn get_file_names(dir: &str) -> Vec<String> {
     std::fs::read_dir(dir)
@@ -444,7 +618,7 @@ mod tests {
     assert_eq!(3, file_names.len());
 
     for i in 0..3 {
-      assert!(file_names.contains(&format!("{}.bitcaskdata", i)));
+      assert!(file_names.contains(&format!("bitcask.data.{}", i)));
     }
 
     Ok(())
@@ -553,23 +727,67 @@ mod tests {
       directory: directory.clone(),
       writer: true,
       max_active_file_size_in_bytes: 5,
+      merge_files_after_n_files_created: 32,
     })?;
 
     assert_eq!(0, bitcask.state.read().unwrap().active_file_id);
+    assert_eq!(1, bitcask.state.read().unwrap().num_files_in_directory);
 
     bitcask.put(bytes("key"), bytes("value_with_more_than_5_bytes"))?;
 
     assert_eq!(1, bitcask.state.read().unwrap().active_file_id);
     assert_eq!(0, bitcask.state.read().unwrap().active_file_size_in_bytes);
+    assert_eq!(2, bitcask.state.read().unwrap().num_files_in_directory);
 
     let file_names = HashSet::from_iter(get_file_names(&directory));
 
     let expected: HashSet<String> = HashSet::from_iter(vec![
-      String::from("0.bitcaskdata"),
-      String::from("1.bitcaskdata"),
+      String::from("bitcask.data.0"),
+      String::from("bitcask.data.1"),
     ]);
 
     assert_eq!(expected, file_names);
+
+    Ok(())
+  }
+
+  #[test_log::test]
+  fn merges_immutable_files_when_threshold_is_surpassed() -> Result<(), Box<dyn std::error::Error>>
+  {
+    let temp_dir = tempfile::tempdir()?;
+    let directory = path(&temp_dir);
+
+    let bitcask = Bitcask::new(Config {
+      directory: directory.clone(),
+      writer: true,
+      max_active_file_size_in_bytes: 1,
+      merge_files_after_n_files_created: 3,
+    })?;
+
+    let key1 = bytes("key1");
+    let value1 = bytes("value1");
+
+    let key2 = bytes("key2");
+    let value2 = bytes("value2");
+
+    bitcask.put(key1.clone(), value1.clone())?;
+    bitcask.put(key2.clone(), value2.clone())?;
+
+    let file_paths: HashSet<String> = Bitcask::get_file_paths(&directory).into_iter().collect();
+
+    let expected: HashSet<String> = vec![
+      format!("{}/bitcask.data.1", &directory),
+      format!("{}/bitcask.hint.1", &directory),
+      format!("{}/bitcask.data.2", &directory),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(expected, file_paths);
+
+    // Ensure we can still accesses the keys we added before the merge.
+    assert_eq!(Some(value1), bitcask.get(&key1)?);
+    assert_eq!(Some(value2), bitcask.get(&key2)?);
 
     Ok(())
   }
