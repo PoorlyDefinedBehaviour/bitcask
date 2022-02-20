@@ -48,6 +48,9 @@ struct MutableState {
   /// Maps a key to an entry containing information about where the
   /// data that belongs to the key is stored.
   index: HashMap<Vec<u8>, IndexEntry>,
+  /// The size of the file that new entries will be written to.
+  /// Used to know when we need to closet the file and create a new one.
+  active_file_size_in_bytes: u64,
   /// The file that new entries will be written to.
   active_file: File,
   /// The id given to `active_file`.
@@ -71,6 +74,9 @@ pub struct Config {
   /// True if this instance of Bitcask is the one that handles writes.
   /// There should always be only once instance that writes to files.
   pub writer: bool,
+  /// The file being written to will be closed when its size is surpasses the maximum file size
+  /// and a new file will be created.
+  pub max_active_file_size_in_bytes: u64,
 }
 
 impl Bitcask {
@@ -91,9 +97,9 @@ impl Bitcask {
     //
     // If we have the following files:
     //
-    // 0.bitcaskdata
-    // 1.bitcaskdata
-    // 2.bitcaskdata
+    // dir/0.bitcaskdata
+    // dir/1.bitcaskdata
+    // dir/2.bitcaskdata
     //
     // we know that the latest file is file number 2.
     let latest_id = file_names
@@ -119,14 +125,19 @@ impl Bitcask {
 
     let data_file_path = directory.join(format!("{}.bitcaskdata", file_id));
 
+    let active_file = OpenOptions::new()
+      .read(true)
+      .create(true)
+      .append(config.writer)
+      .open(data_file_path)?;
+
+    let active_file_size_in_bytes = active_file.metadata()?.len();
+
     let state = MutableState {
       active_file_id: file_id,
       index: HashMap::new(),
-      active_file: OpenOptions::new()
-        .read(true)
-        .create(true)
-        .append(config.writer)
-        .open(data_file_path)?,
+      active_file_size_in_bytes,
+      active_file,
     };
 
     Ok(Self {
@@ -145,8 +156,20 @@ impl Bitcask {
     )
   )]
   pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> std::io::Result<()> {
+    const CHECKSUM_SIZE_IN_BYTES: u64 = 4;
+    const TIMESTAMP_SIZE_IN_BYTES: u64 = 4;
+    const KEY_LEN_SIZE_IN_BYTES: u64 = 4;
+    const VALUE_LEN_SIZE_IN_BYTES: u64 = 4;
+
     let key_len = key.len();
     let value_len = value.len();
+
+    let entry_size_in_bytes = CHECKSUM_SIZE_IN_BYTES
+      + TIMESTAMP_SIZE_IN_BYTES
+      + KEY_LEN_SIZE_IN_BYTES
+      + VALUE_LEN_SIZE_IN_BYTES
+      + key_len as u64
+      + value_len as u64;
 
     let mut content_for_checksum = Vec::with_capacity(key_len + value_len);
 
@@ -185,6 +208,8 @@ impl Bitcask {
 
     info!(?entry, "creating index entry");
     let _ = state.index.insert(key, entry);
+
+    state.active_file_size_in_bytes += entry_size_in_bytes;
 
     Ok(())
   }
@@ -360,6 +385,7 @@ mod tests {
     Bitcask::new(Config {
       directory,
       writer: true,
+      max_active_file_size_in_bytes: 1024 * 1024,
     })
   }
 
