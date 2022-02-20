@@ -573,7 +573,7 @@ impl Bitcask {
     })
   }
 
-  /// Forgets about the key.
+  /// Appends a new entry to the active file.
   #[instrument(
       name = "Appending new entry to active file",
       skip_all,
