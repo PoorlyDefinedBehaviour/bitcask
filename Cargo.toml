@@ -17,3 +17,8 @@ tempfile = "3.3.0"
 test-log = { version = "0.2.8", default-features = false, features = ["trace"] }
 quickcheck = "1.0.3"
 quickcheck_macros = "0.9.1"
+
+[lib]
+name = "bitcask"
+path = "src/lib.rs"
+
