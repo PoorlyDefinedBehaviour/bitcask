@@ -43,7 +43,6 @@ enum Operation {
 ///                                          └───────────────────────size of────────────┘
 #[derive(Debug)]
 struct Record {
-  checksum: u32,
   timestamp: u32,
   key: Vec<u8>,
   value: Vec<u8>,
@@ -586,7 +585,6 @@ impl Bitcask {
     let key = buffer;
 
     Ok(Record {
-      checksum,
       timestamp,
       key,
       value,
