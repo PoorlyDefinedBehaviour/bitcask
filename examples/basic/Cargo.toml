@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 bitcask = { git = "https://github.com/poorlydefinedbehaviour/bitcask", branch = "main"}
 rand = "0.8.5"
+tempfile = "3.3.0"

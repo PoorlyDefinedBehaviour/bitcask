@@ -386,7 +386,7 @@ impl Bitcask {
     // Create a temporary file.
     let merged_file_id = state.active_file_id - 1;
     let merged_file_path =
-      Path::new(&self.config.directory).join(format!("bitcask.data.merged.{}", merged_file_id));
+      Path::new(&self.config.directory).join(format!("bitcask.data.temp.{}", merged_file_id));
 
     let mut merged_file_writer = BufWriter::new(
       OpenOptions::new()
@@ -396,12 +396,14 @@ impl Bitcask {
         .open(&merged_file_path)?,
     );
 
+    let hint_file_path =
+      Path::new(&self.config.directory).join(format!("bitcask.hint.temp.{}", merged_file_id));
     let mut hint_file_writer = BufWriter::new(
       OpenOptions::new()
         .read(true)
         .create(true)
         .append(self.config.writer)
-        .open(Path::new(&self.config.directory).join(format!("bitcask.hint.{}", merged_file_id)))?,
+        .open(&hint_file_path)?,
     );
 
     let mut index = HashMap::new();
@@ -452,6 +454,9 @@ impl Bitcask {
 
     state.index = index;
 
+    // Take the new merged file into account.
+    state.num_files_in_directory += 1;
+
     for (_file_id, file_path) in file_paths.iter() {
       info!(?file_path, "removing old data file that has been merged");
       // This error is not a show stopper since we can just reprocess the file after in the next merge.
@@ -462,30 +467,44 @@ impl Bitcask {
           break;
         }
         Ok(_) => {
+          // Try to remove the hint file but ignore the error because it may not exist.
+          // let _ = std::fs::remove_file(file_path.replace(".data", ".hint"));
+
           state.num_files_in_directory -= 1;
         }
       }
     }
 
     // Since everything worked out, promote the temporary file to a data file.
-    self.promote_merged_file_to_data_file(&merged_file_path, merged_file_id)?;
+    self.promote_merged_file_to_data_file(&merged_file_path, &hint_file_path)?;
 
     Ok(())
   }
 
   #[instrument(
-    name = "Promoting merged file to data file",
+    name = "Promoting merged files",
     skip_all,
-    fields(merged_file_path = ?merged_file_path, merged_file_id = merged_file_id)
+    fields(merged_file_path = ?merged_file_path, hint_file_path = ?hint_file_path)
   )]
   fn promote_merged_file_to_data_file(
     &self,
     merged_file_path: &Path,
-    merged_file_id: usize,
+    hint_file_path: &Path,
   ) -> std::io::Result<()> {
     std::fs::rename(
       merged_file_path,
-      Path::new(&self.config.directory).join(format!("bitcask.data.{}", merged_file_id)),
+      merged_file_path
+        .to_str()
+        .unwrap()
+        .replace("bitcask.data.temp", "bitcask.data"),
+    )?;
+
+    std::fs::rename(
+      hint_file_path,
+      hint_file_path
+        .to_str()
+        .unwrap()
+        .replace("bitcask.hint.temp", "bitcask.hint"),
     )
   }
 
@@ -498,6 +517,7 @@ impl Bitcask {
   pub fn get(&self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
     let entry = {
       let state = self.state.read().unwrap();
+
       match state.index.get(key) {
         None => return Ok(None),
         // Cloning this should be fine since
@@ -712,7 +732,7 @@ impl Bitcask {
 
 #[cfg(test)]
 mod tests {
-  use std::collections::HashSet;
+  use std::{collections::HashSet, sync::Arc, thread::JoinHandle, vec};
 
   use tempfile::TempDir;
 
@@ -981,6 +1001,42 @@ mod tests {
     assert_eq!(Some(value1), bitcask.get(&key1)?);
     assert_eq!(Some(value2), bitcask.get(&key2)?);
     assert_eq!(None, bitcask.get(&key3)?);
+
+    Ok(())
+  }
+
+  #[quickcheck_macros::quickcheck]
+  fn a_few_threads(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let directory = path(&dir);
+
+    let bitcask = Arc::new(Bitcask::new(Config {
+      directory,
+      writer: true,
+      max_active_file_size_in_bytes: 5,
+      merge_files_after_n_files_created: 3,
+    })?);
+
+    let handles: Vec<JoinHandle<()>> = entries
+      .iter()
+      .cloned()
+      .map(|(key, value)| {
+        let bitcask = Arc::clone(&bitcask);
+
+        std::thread::spawn(move || {
+          bitcask.put(key.clone(), value).expect("error putting key");
+          bitcask.delete(&key).expect("error deleting key");
+        })
+      })
+      .collect();
+
+    for handle in handles {
+      handle.join().expect("error joining thread");
+    }
+
+    for (key, _) in entries {
+      assert_eq!(None, bitcask.get(&key)?);
+    }
 
     Ok(())
   }
